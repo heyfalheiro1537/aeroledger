@@ -1,0 +1,10 @@
+# Alternativa ao scripts/pg_local.sh: PostgreSQL em localhost:54329.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: aeroledger
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: aeroledger
+    ports:
+      - "54329:5432"

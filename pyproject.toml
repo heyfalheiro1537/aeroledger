@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aeroledger"
+version = "0.5.0"
+description = "Ledger em que só se escreve, para dados aeroportuários geolocalizados e auditáveis."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Heyder" }]
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "pyproj>=3.6",
+    "shapely>=2.0",
+]
+
+[project.optional-dependencies]
+testes = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aeroledger = ["sql/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
