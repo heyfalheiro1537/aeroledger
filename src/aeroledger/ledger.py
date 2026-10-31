@@ -67,12 +67,18 @@ def _checar_arvore(plano: dict):
 
 # ---------------------------------------------------------------- hash
 
+# Campos do envelope que só entram no hash quando presentes. Assim um evento
+# sem grupo tem exatamente o mesmo hash que na versão 0.5.0.
+OPCIONAIS = ("grupo_id", "grupo_n")
+
+
 def conteudo_para_hash(env: dict, campos: list) -> dict:
+    env = {k: v for k, v in env.items() if not (k in OPCIONAIS and v is None)}
     return {**env, "campos": sorted(campos, key=lambda c: c["path"])}
 
 
 ENVELOPE = ("event_id", "run_id", "feature_id", "feature_type", "event_type",
-            "asserted_by", "owner_ref", "reason", "caused_by", "prev_hash")
+            "asserted_by", "owner_ref", "reason", "caused_by", "prev_hash", "grupo_id", "grupo_n")
 
 
 # ---------------------------------------------------------------- limites de tempo
@@ -90,6 +96,63 @@ def _limite(conn, run_id, t):
 def append_event(conn, run_id, feature_id, feature_type, event_type, *, asserted_by,
                  corpo=None, alteracoes=None, reason=None, owner_ref=None, caused_by=None):
     """Escreve um evento. Devolve (event_id, hash)."""
+    try:
+        with conn.cursor() as cur:
+            agora_, shard = _travar_run(cur, run_id)
+            r = _escrever(conn, cur, run_id, shard, agora_, feature_id, feature_type, event_type,
+                          asserted_by=asserted_by, corpo=corpo, alteracoes=alteracoes, reason=reason,
+                          owner_ref=owner_ref, caused_by=caused_by)
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+    return r
+
+
+def append_group(conn, run_id, eventos):
+    """Escreve vários eventos como uma mudança só. Devolve [(event_id, hash)].
+
+    Cada item de 'eventos' é um dict com os argumentos de append_event
+    (feature_id, feature_type, event_type, asserted_by, corpo, alteracoes, ...).
+    Os eventos ficam contíguos na cadeia, no mesmo instante, e levam no
+    envelope grupo_id (o event_id do primeiro) e grupo_n (quantos são); os dois
+    entram no hash. Ou todos são escritos, ou nenhum. Quem lê o tópico só corta
+    o histórico em fronteira de grupo.
+    """
+    eventos = list(eventos)
+    if len(eventos) < 2:
+        raise LedgerError("grupo precisa de pelo menos dois eventos; para um, use append_event")
+    out = []
+    try:
+        with conn.cursor() as cur:
+            agora_, shard = _travar_run(cur, run_id)
+            gid = None
+            for ev in eventos:
+                ev = dict(ev)
+                fid, ft, et = ev.pop("feature_id"), ev.pop("feature_type"), ev.pop("event_type")
+                eid, h = _escrever(conn, cur, run_id, shard, agora_, fid, ft, et,
+                                   grupo=(gid, len(eventos)), **ev)
+                gid = gid or eid
+                out.append((eid, h))
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+    return out
+
+
+def _travar_run(cur, run_id):
+    cur.execute("SELECT shard, relogio FROM run WHERE run_id = %s FOR UPDATE", (run_id,))
+    linha = cur.fetchone()
+    if linha is None:
+        raise LedgerError(f"run inexistente: {run_id}")
+    shard, agora_ = linha
+    return agora_, shard
+
+
+def _escrever(conn, cur, run_id, shard, agora_, feature_id, feature_type, event_type, *, asserted_by,
+              corpo=None, alteracoes=None, reason=None, owner_ref=None, caused_by=None, grupo=None):
+    """Valida e insere um evento dentro da transação aberta (sem commit)."""
     if event_type not in TIPOS:
         raise LedgerError(f"tipo de evento inválido: {event_type}")
     if not asserted_by:
@@ -114,82 +177,76 @@ def append_event(conn, run_id, feature_id, feature_type, event_type, *, asserted
         if not PATH_RE.match(p):
             raise LedgerError(f"path malformado: {p!r}")
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT shard, relogio FROM run WHERE run_id = %s FOR UPDATE", (run_id,))
-        linha = cur.fetchone()
-        if linha is None:
-            raise LedgerError(f"run inexistente: {run_id}")
-        shard, agora_ = linha
+    # envelope imutável
+    cur.execute("""SELECT feature_type, owner_ref FROM event
+                   WHERE run_id = %s AND feature_id = %s ORDER BY event_id LIMIT 1""", (run_id, feature_id))
+    primeiro = cur.fetchone()
+    if primeiro and (primeiro[0] != feature_type or primeiro[1] != owner_ref):
+        raise LedgerError("envelope imutável: feature_type e owner_ref não mudam; crie outra feature")
 
-        # envelope imutável
-        cur.execute("""SELECT feature_type, owner_ref FROM event
-                       WHERE run_id = %s AND feature_id = %s ORDER BY event_id LIMIT 1""", (run_id, feature_id))
-        primeiro = cur.fetchone()
-        if primeiro and (primeiro[0] != feature_type or primeiro[1] != owner_ref):
-            raise LedgerError("envelope imutável: feature_type e owner_ref não mudam; crie outra feature")
+    # ciclo de vida
+    t_lim = relogio.limite(agora_)
+    cur.execute("SELECT viva_em(%s, %s, %s)", (run_id, feature_id, t_lim))
+    viva = cur.fetchone()[0]
+    if event_type == "BASELINE" and viva:
+        raise LedgerError("BASELINE sobre feature viva; use DELTA, ou VOID antes")
+    if event_type in ("DELTA", "VOID") and not viva:
+        raise LedgerError(f"{event_type} sem BASELINE vigente")
 
-        # ciclo de vida
-        t_lim = relogio.limite(agora_)
-        cur.execute("SELECT viva_em(%s, %s, %s)", (run_id, feature_id, t_lim))
-        viva = cur.fetchone()[0]
-        if event_type == "BASELINE" and viva:
-            raise LedgerError("BASELINE sobre feature viva; use DELTA, ou VOID antes")
-        if event_type in ("DELTA", "VOID") and not viva:
-            raise LedgerError(f"{event_type} sem BASELINE vigente")
+    # estado resultante (forma da árvore e seeds)
+    atual = {}
+    if event_type == "DELTA":
+        cur.execute("SELECT path, valor FROM estado_em(%s, %s, %s)", (run_id, feature_id, t_lim))
+        atual = dict(cur.fetchall())
+        for p, v in novos.items():
+            if v is REMOVIDO and p not in atual:
+                raise LedgerError(f"remoção de campo ausente: {p}")
+    resultante = {**atual, **novos}
+    resultante = {p: v for p, v in resultante.items() if v is not REMOVIDO}
+    _checar_arvore(resultante)
+    if event_type != "VOID":
+        from .referencial import validar_escrita
+        validar_escrita(conn, run_id, feature_id, feature_type, resultante, t_lim)
 
-        # estado resultante (forma da árvore e seeds)
-        atual = {}
-        if event_type == "DELTA":
-            cur.execute("SELECT path, valor FROM estado_em(%s, %s, %s)", (run_id, feature_id, t_lim))
-            atual = dict(cur.fetchall())
-            for p, v in novos.items():
-                if v is REMOVIDO and p not in atual:
-                    raise LedgerError(f"remoção de campo ausente: {p}")
-        resultante = {**atual, **novos}
-        resultante = {p: v for p, v in resultante.items() if v is not REMOVIDO}
-        _checar_arvore(resultante)
-        if event_type != "VOID":
-            from .referencial import validar_escrita
-            validar_escrita(conn, run_id, feature_id, feature_type, resultante, t_lim)
+    # causa
+    if caused_by is not None:
+        cur.execute("SELECT 1 FROM event WHERE run_id = %s AND event_id = %s", (run_id, caused_by))
+        if cur.fetchone() is None:
+            raise LedgerError("caused_by aponta para evento inexistente neste run")
 
-        # causa
-        if caused_by is not None:
-            cur.execute("SELECT 1 FROM event WHERE run_id = %s AND event_id = %s", (run_id, caused_by))
-            if cur.fetchone() is None:
-                raise LedgerError("caused_by aponta para evento inexistente neste run")
+    # identificador e encadeamento
+    cur.execute("SELECT event_id, hash FROM event WHERE run_id = %s ORDER BY event_id DESC LIMIT 1", (run_id,))
+    ult = cur.fetchone()
+    ms_ = relogio.ms(agora_)
+    seq = 0
+    if ult:
+        ult_ms = ult[0] >> (relogio.BITS_SHARD + relogio.BITS_SEQ)
+        if ult_ms > ms_:
+            raise LedgerError("relógio atrás do último evento")
+        if ult_ms == ms_:
+            seq = (ult[0] & ((1 << relogio.BITS_SEQ) - 1)) + 1
+    eid = relogio.compor(ms_, shard, seq)
+    prev_hash = ult[1] if ult else None
+    grupo_id, grupo_n = (None, None) if grupo is None else (grupo[0] or eid, grupo[1])
 
-        # identificador e encadeamento
-        cur.execute("SELECT event_id, hash FROM event WHERE run_id = %s ORDER BY event_id DESC LIMIT 1", (run_id,))
-        ult = cur.fetchone()
-        ms_ = relogio.ms(agora_)
-        seq = 0
-        if ult:
-            ult_ms = ult[0] >> (relogio.BITS_SHARD + relogio.BITS_SEQ)
-            if ult_ms > ms_:
-                raise LedgerError("relógio atrás do último evento")
-            if ult_ms == ms_:
-                seq = (ult[0] & ((1 << relogio.BITS_SEQ) - 1)) + 1
-        eid = relogio.compor(ms_, shard, seq)
-        prev_hash = ult[1] if ult else None
+    campos = [{"path": p, "op": "removed" if v is REMOVIDO else "set",
+               "next": None if v is REMOVIDO else v} for p, v in novos.items()]
+    env = {"event_id": eid, "run_id": run_id, "feature_id": feature_id, "feature_type": feature_type,
+           "event_type": event_type, "asserted_by": asserted_by, "owner_ref": owner_ref,
+           "reason": reason, "caused_by": caused_by, "prev_hash": prev_hash,
+           "grupo_id": grupo_id, "grupo_n": grupo_n}
+    h = sha256(conteudo_para_hash(env, campos))
 
-        campos = [{"path": p, "op": "removed" if v is REMOVIDO else "set",
-                   "next": None if v is REMOVIDO else v} for p, v in novos.items()]
-        env = {"event_id": eid, "run_id": run_id, "feature_id": feature_id, "feature_type": feature_type,
-               "event_type": event_type, "asserted_by": asserted_by, "owner_ref": owner_ref,
-               "reason": reason, "caused_by": caused_by, "prev_hash": prev_hash}
-        h = sha256(conteudo_para_hash(env, campos))
-
-        cur.execute("""INSERT INTO event (event_id, run_id, feature_id, feature_type, event_type, asserted_by,
-                                          owner_ref, reason, caused_by, prev_hash, hash)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (eid, run_id, feature_id, feature_type, event_type, asserted_by,
-                     owner_ref, reason, caused_by, prev_hash, h))
-        for c in campos:
-            cur.execute("""INSERT INTO event_field (event_id, run_id, feature_id, path, op, next)
-                           VALUES (%s,%s,%s,%s,%s,%s)""",
-                        (eid, run_id, feature_id, c["path"], c["op"],
-                         None if c["op"] == "removed" else Jsonb(c["next"])))
-    conn.commit()
+    cur.execute("""INSERT INTO event (event_id, run_id, feature_id, feature_type, event_type, asserted_by,
+                                      owner_ref, reason, caused_by, prev_hash, grupo_id, grupo_n, hash)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (eid, run_id, feature_id, feature_type, event_type, asserted_by,
+                 owner_ref, reason, caused_by, prev_hash, grupo_id, grupo_n, h))
+    for c in campos:
+        cur.execute("""INSERT INTO event_field (event_id, run_id, feature_id, path, op, next)
+                       VALUES (%s,%s,%s,%s,%s,%s)""",
+                    (eid, run_id, feature_id, c["path"], c["op"],
+                     None if c["op"] == "removed" else Jsonb(c["next"])))
     return eid, h
 
 
@@ -322,9 +379,7 @@ def marca_dagua(conn, run_id, feature_ids, t=None):
 
 def envelope(conn, event_id):
     with conn.cursor() as cur:
-        cur.execute("""SELECT event_id, run_id, feature_id, feature_type, event_type, asserted_by,
-                              owner_ref, reason, caused_by, prev_hash, hash FROM event WHERE event_id = %s""",
-                    (event_id,))
+        cur.execute(f"SELECT {', '.join(ENVELOPE)}, hash FROM event WHERE event_id = %s", (event_id,))
         r = cur.fetchone()
     return dict(zip(ENVELOPE + ("hash",), r)) if r else None
 
@@ -335,9 +390,8 @@ def verify_chain(conn, run_id):
     Devolve [primeiro event_id divergente], ou [] se a cadeia está íntegra.
     """
     with conn.cursor() as cur:
-        cur.execute("""SELECT event_id, run_id, feature_id, feature_type, event_type, asserted_by,
-                              owner_ref, reason, caused_by, prev_hash, hash
-                       FROM event WHERE run_id = %s ORDER BY event_id""", (run_id,))
+        cur.execute(f"SELECT {', '.join(ENVELOPE)}, hash FROM event WHERE run_id = %s ORDER BY event_id",
+                    (run_id,))
         eventos = cur.fetchall()
         cur.execute("""SELECT event_id, path, op, next FROM event_field WHERE run_id = %s""", (run_id,))
         campos = {}
@@ -345,8 +399,8 @@ def verify_chain(conn, run_id):
             campos.setdefault(eid, []).append({"path": path, "op": op, "next": nxt})
     anterior = None
     for linha in eventos:
-        env = dict(zip(ENVELOPE, linha[:10]))
-        guardado = linha[10]
+        env = dict(zip(ENVELOPE, linha[:-1]))
+        guardado = linha[-1]
         if env["prev_hash"] != anterior:
             return [env["event_id"]]
         if sha256(conteudo_para_hash(env, campos.get(env["event_id"], []))) != guardado:

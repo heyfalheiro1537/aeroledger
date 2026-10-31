@@ -36,9 +36,13 @@ CREATE TABLE IF NOT EXISTS event (
     reason          TEXT,
     caused_by       BIGINT REFERENCES event(event_id),
     prev_hash       CHAR(64),
+    grupo_id        BIGINT,                        -- event_id do primeiro evento do grupo (append_group)
+    grupo_n         INTEGER,                       -- quantos eventos o grupo tem
     hash            CHAR(64) NOT NULL,
     CHECK (event_type <> 'VOID' OR reason IS NOT NULL),
     CHECK (caused_by IS NULL OR caused_by < event_id),
+    CHECK ((grupo_id IS NULL) = (grupo_n IS NULL)),
+    CHECK (grupo_id IS NULL OR (grupo_id <= event_id AND grupo_n >= 2)),
     UNIQUE (event_id, run_id, feature_id)          -- alvo da FK de event_field
 );
 

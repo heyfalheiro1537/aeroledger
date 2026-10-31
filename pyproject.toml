@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aeroledger"
-version = "0.5.0"
+version = "0.6.0"
 description = "Ledger em que só se escreve, para dados aeroportuários geolocalizados e auditáveis."
 readme = "README.md"
 requires-python = ">=3.12"

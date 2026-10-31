@@ -12,6 +12,7 @@ Ela responde a quatro perguntas sobre qualquer dado guardado:
 | Quem afirmou, e por quê? | todo evento tem autor (`asserted_by`), motivo (`reason`) e causa (`caused_by`) |
 | O número está certo? | valores derivados (comprimento, rumo, distâncias declaradas) são recalculados das premissas, nunca guardados |
 | Alguém mexeu no banco? | os eventos são encadeados por hash; alterar, apagar ou inserir quebra a cadeia |
+| Quem lê sem acesso ao banco pode confiar? | a leitura vem de um tópico com o log do run; cada consumidor confere a cadeia, monta só o que precisa e responde com limite explícito |
 
 ---
 
@@ -112,7 +113,23 @@ Um referente é georreferenciado (`lat`, `lon`) ou relativo a outro (`elemento`,
 
 **Derivados.** Comprimento, azimutes, rumo magnético e distâncias declaradas (TORA, TODA, ASDA, LDA) são calculados na leitura, pela geodésica sobre o GRS80 e pela regra do Anexo 14. Nunca são escritos.
 
-**Cadeia de hash.** `hash = SHA-256(JCS(envelope + prev_hash + campos))`, com JCS = RFC 8785. Qualquer terceiro pode reimplementar a verificação a partir dessa especificação (o repositório dos experimentos tem um verificador independente que não importa esta biblioteca). Alterações que não deixam sucessor (mexer só no último evento, truncar, reescrever tudo) só são detectadas comparando a cabeça com uma âncora guardada fora do banco.
+**Grupo.** Quando uma mudança precisa de vários eventos (a carga de uma edição do AIP, por exemplo), `escrever_grupo` os grava juntos: ou todos, ou nenhum, contíguos na cadeia e no mesmo instante. O envelope de cada um leva `grupo_id` (o `event_id` do primeiro) e `grupo_n` (quantos são). Quem lê pelo tópico nunca vê o grupo pela metade.
+
+**Cadeia de hash.** `hash = SHA-256(JCS(envelope + prev_hash + campos))`, com JCS = RFC 8785. `grupo_id` e `grupo_n` só entram no conteúdo quando o evento é de um grupo; assim, um evento fora de grupo tem o mesmo hash que na versão 0.5.0. Qualquer terceiro pode reimplementar a verificação a partir dessa especificação (o repositório dos experimentos tem um verificador independente que não importa esta biblioteca). Alterações que não deixam sucessor (mexer só no último evento, truncar, reescrever tudo) só são detectadas comparando a cabeça com uma âncora guardada fora do banco.
+
+**Escrita e leitura separadas (CQRS).** O ledger no PostgreSQL é a única fonte de verdade e serve à escrita, que precisa ser consistente. A leitura não fala com ele:
+
+```
+ledger ──retransmitir──▶ tópico geral ──consumir──▶ consumidor (projeção local)
+```
+
+- **Tópico geral.** O log ordenado do run publicado para fora do banco (CDC). O retransmissor não guarda estado (o cursor é o último evento no tópico), não espera ninguém e pode refazer o tópico do zero a partir do ledger. Antes do evento que adota um referencial, publica o corpo dele, endereçado pelo conteúdo. É um tópico só, com tudo; tópicos por nó seriam otimização derivada deste.
+- **Canal não confiável.** O consumidor recalcula o hash de cada evento e confere o elo `prev_hash` antes de aplicar. Mensagem alterada, removida, inserida ou fora de ordem para o consumo ali (`TopicoCorrompido`); se o elo não fecha, ele volta ao ponto comum (bifurcação) ou descarta o último aplicado, e fica num prefixo confiável. Entrega repetida e idêntica é ignorada.
+- **Consumidor.** Lê tudo, com checkpoint, no ritmo dele (laço, cron, uma vez). Grupos só entram inteiros. Na leitura, dobra só o **fecho de dependência** das raízes que assinou (arestas declaradas: `owner_ref` e valores iguais ao id de outra feature, nos dois sentidos; quem tem seed depende do `airport`) e deriva localmente.
+- **Limite explícito.** `ler(ate)` exige um `event_id` ou um instante; não existe "agora". Mesmo limite, mesma resposta em qualquer consumidor. Se o limite passa do que o consumidor recebeu, ele recusa (`ConsumidorAtrasado`): ler o que se escreveu é pedir "pelo menos N".
+- **Resposta como dado.** `{run_id, ate, cabeca, raizes, fecho, estados, referencial, derivados, regra, hash_derivados, hash}`, com `regra` = SHA-256 do código que derivou.
+
+O que o encadeamento não prova: que o consumidor recebeu **tudo**. Um tópico cortado no fim parece só atrasado, e um evento falso anexado no fim passa pelo elo; os dois só aparecem comparando a cabeça do consumidor com a âncora (ou com o ledger).
 
 ---
 
@@ -136,6 +153,7 @@ Tudo abaixo está em `import aeroledger as al`. Os módulos completos (`al.ledge
 | Função | O que faz |
 |---|---|
 | `escrever(conn, run, feature_id, feature_type, event_type, *, asserted_by, corpo=None, alteracoes=None, reason=None, owner_ref=None, caused_by=None)` | escreve um evento; devolve `(event_id, hash)`; levanta `LedgerError` se a forma for inválida |
+| `escrever_grupo(conn, run, [ {feature_id, feature_type, event_type, asserted_by, ...}, ... ])` | escreve dois ou mais eventos como uma mudança só (tudo ou nada); devolve `[(event_id, hash)]` |
 | `publicar_referencial(conn, corpo)` | valida e grava um referencial; devolve `ref_id` (não escreve evento) |
 
 `escrever` recusa, sem gravar nada: tipo inválido; `DELTA`/`VOID` sem `BASELINE` vigente; `BASELINE` sobre feature viva; envelope alterado; `VOID` sem motivo; autor vazio; caminho malformado; remoção de campo ausente; campo que é folha e prefixo ao mesmo tempo; `caused_by` inexistente; seed apontando para referente inexistente; troca de referencial que deixaria seed órfã.
@@ -172,9 +190,21 @@ Tudo abaixo está em `import aeroledger as al`. Os módulos completos (`al.ledge
 | `projecao.projetar(conn, run, t=None, tipos=None, camadas=None)` | leitura por tipo e camada, com cache invalidado só por eventos da própria seleção |
 | `motor.gerar(geometria, corpo_referencial)` | geometria (shapely, plano local em metros) a partir das seeds; demonstração |
 
+### Tópico e consumidores (`al.topico`)
+
+| Função | O que faz |
+|---|---|
+| `TopicoMemoria()` | tópico em memória (`anexar`, `ler(desde, maximo)`, `fim()`): o contrato que um adaptador para Kafka cumpriria |
+| `retransmitir(conn, run, topico)` | CDC: anexa os eventos do ledger que ainda não estão no tópico; devolve quantos |
+| `Consumidor(topico, raizes=None, nome=...)` | projeção local; `raizes=None` assina todas as features |
+| `c.consumir(maximo=None)` | lê a partir do checkpoint, confere e aplica; devolve quantos eventos aplicou |
+| `c.ler(ate)` | estado e derivados do fecho ao fim de `ate` (`event_id` ou `datetime`), como dado |
+| `c.cabeca`, `c.offset`, `c.em_dia()` | último evento aplicado, checkpoint, e se há mensagem nova |
+| `c.salvar(caminho)`, `Consumidor.carregar(caminho, topico)` | checkpoint em arquivo; ao retomar, o log local é conferido de novo |
+
 ### Erros
 
-`LedgerError` (forma do evento), `ReferencialError` (regras do referencial), `RelogioError` (tempo), `RegraPendente` (derivação sem regra registrada, como barreira de contenção).
+`LedgerError` (forma do evento), `ReferencialError` (regras do referencial), `RelogioError` (tempo), `RegraPendente` (derivação sem regra registrada, como barreira de contenção), `topico.TopicoCorrompido` (mensagem que não confere; tem `offset` e `motivo`), `topico.ConsumidorAtrasado` (limite além do que o consumidor recebeu).
 
 ---
 
@@ -185,7 +215,7 @@ scripts/pg_local.sh          # ou: docker compose up -d
 python3 -m pytest -q
 ```
 
-Os 39 testes usam um aeródromo fictício e criam um banco descartável por teste. Para outro servidor, defina `AEROLEDGER_DSN_ADMIN` (conexão ao banco `postgres`, com permissão para criar bancos). Cobrem: campo ausente ≠ null, ciclo de vida, snapshot igual à reconstrução, as rejeições de escrita, as regras do referencial, a resolução de seeds, a remedição sem escrita em seed, as derivações e o cache de projeção.
+Os 57 testes usam um aeródromo fictício e criam um banco descartável por teste. Para outro servidor, defina `AEROLEDGER_DSN_ADMIN` (conexão ao banco `postgres`, com permissão para criar bancos). Cobrem: campo ausente ≠ null, ciclo de vida, snapshot igual à reconstrução, as rejeições de escrita, as regras do referencial, a resolução de seeds, a remedição sem escrita em seed, as derivações, o cache de projeção, os grupos (contíguos, no hash, tudo ou nada) e o tópico: consumidor igual ao ledger em cada fronteira, corte que nunca cai dentro de um grupo, cadências diferentes e retomada após queda chegando ao mesmo hash, subconjunto com os mesmos derivados, canal adulterado (remover, alterar, alterar e recalcular, inserir), entrega repetida, referencial adulterado ou ausente e leitura com o ledger fora.
 
 ## Limites conhecidos
 
@@ -193,3 +223,5 @@ Os 39 testes usam um aeródromo fictício e criam um banco descartável por test
 - Sem âncora externa, quem controla o banco inteiro pode reescrever a cadeia sem ser detectado pela própria biblioteca.
 - A regra de distâncias declaradas com barreira de contenção não está implementada (`RegraPendente`).
 - O motor de geometria (retângulo, ponto, arco) é demonstração; não foi validado contra cartas.
+- O tópico é em memória: o transporte real (Kafka), tópicos por nó, confidencialidade (quem assina recebe tudo) e ordem entre runs (aeroportos) ficam fora; o consumidor guarda o log inteiro e filtra só na leitura.
+- A escrita ainda serializa por run com lock pessimista (`SELECT … FOR UPDATE`); o lock otimista com versão por feature está decidido e não implementado.
