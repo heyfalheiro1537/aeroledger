@@ -84,11 +84,36 @@ ENVELOPE = ("event_id", "run_id", "feature_id", "feature_type", "event_type",
 # ---------------------------------------------------------------- limites de tempo
 
 def _limite(conn, run_id, t):
+    """Limite de leitura: maior event_id visível em t, sem nunca cortar um grupo.
+
+    t pode ser None (o relógio do run), um instante ou um event_id. Se o limite
+    cai dentro de um grupo (o último evento até ele pertence a um grupo de que
+    nem todos os eventos estão até o limite), a leitura recua para antes do
+    grupo, como faz o consumidor do tópico. Só a leitura passa por aqui; a
+    escrita usa relogio.limite diretamente.
+    """
     if t is None:
-        return relogio.limite(relogio.agora(conn, run_id))
-    if isinstance(t, datetime):
-        return relogio.limite(t)
-    return int(t)
+        lim = relogio.limite(relogio.agora(conn, run_id))
+    elif isinstance(t, datetime):
+        lim = relogio.limite(t)
+    else:
+        lim = int(t)
+    return _recuar_grupo(conn, run_id, lim)
+
+
+def _recuar_grupo(conn, run_id, lim):
+    with conn.cursor() as cur:
+        cur.execute("""SELECT grupo_id, grupo_n FROM event WHERE run_id = %s AND event_id <= %s
+                       ORDER BY event_id DESC LIMIT 1""", (run_id, lim))
+        ult = cur.fetchone()
+        if ult is None or ult[0] is None:
+            return lim
+        gid, gn = ult
+        cur.execute("SELECT count(*) FROM event WHERE run_id = %s AND grupo_id = %s AND event_id <= %s",
+                    (run_id, gid, lim))
+        if cur.fetchone()[0] < gn:
+            return gid - 1
+    return lim
 
 
 # ---------------------------------------------------------------- escrita

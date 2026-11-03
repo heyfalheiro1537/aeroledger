@@ -13,9 +13,11 @@ def carga_em_grupo(conn, run):
     """THR_A/THR_B e a SWY entram como uma mudança só."""
     return ledger.append_group(conn, run, [
         {"feature_id": "XXXX-THR05", "feature_type": "runway_direction", "event_type": "BASELINE",
-         "asserted_by": "t", "corpo": {"adc": {"designador": "05", "pista": "XXXX-RWY", "deslocamento_m": 100.0}}},
+         "asserted_by": "t", "corpo": {"adc": {"designador": "05", "pista": "XXXX-RWY", "deslocamento_m": 100.0,
+                                       "tem_swy": True, "tem_cwy": False}}},
         {"feature_id": "XXXX-THR23", "feature_type": "runway_direction", "event_type": "BASELINE",
-         "asserted_by": "t", "corpo": {"adc": {"designador": "23", "pista": "XXXX-RWY"}}},
+         "asserted_by": "t", "corpo": {"adc": {"designador": "23", "pista": "XXXX-RWY", "deslocamento_m": 0,
+                                       "tem_swy": True, "tem_cwy": False}}},
         {"feature_id": "XXXX-SWY23", "feature_type": "protect_area", "event_type": "BASELINE", "asserted_by": "t",
          "corpo": {"adc": {"papel": "swy", "aplica_a": {"pista": "XXXX-RWY", "direcao": "23"}},
                    "geometria": {"primitivos": {"swy": {"tipo": "retangulo", "inicio": seed("THR_A"),
@@ -25,7 +27,7 @@ def carga_em_grupo(conn, run):
 
 @pytest.fixture
 def cenario(conn):
-    run = montar(conn)
+    run = montar(conn, com_cabeceiras=False)
     relogio.avancar(conn, run, dias=1)
     grupo = carga_em_grupo(conn, run)
     relogio.avancar(conn, run, dias=1)
@@ -142,10 +144,17 @@ def test_corte_no_meio_do_grupo_cai_na_fronteira(conn, cenario):
     antes = ids(conn, run)[ids(conn, run).index(grupo[0][0]) - 1]
     for e, _ in grupo[:-1]:
         assert c.ler(e)["ate"] == antes
-    # o ledger, cortado no mesmo ponto, mostraria a mudança pela metade
-    assert ledger.reconstruct_state(conn, run, "XXXX-THR05", grupo[0][0]) is not None
-    assert ledger.reconstruct_state(conn, run, "XXXX-SWY23", grupo[0][0]) is None
     assert "XXXX-THR05" not in c.ler(grupo[0][0])["estados"]
+    # a leitura do ledger, cortada no mesmo ponto, também recua para antes do grupo
+    for e, _ in grupo[:-1]:
+        assert antes <= ledger._limite(conn, run, e) < grupo[0][0]   # nenhum evento entre os dois
+        assert ledger.reconstruct_state(conn, run, "XXXX-THR05", e) is None
+        assert "XXXX-THR05" not in {f for f, _ in ledger.features(conn, run, e)}
+    assert ledger._limite(conn, run, grupo[-1][0]) == grupo[-1][0]
+    # a primitiva SQL, que não conhece grupos, mostraria a mudança pela metade
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM estado_em(%s, %s, %s)", (run, "XXXX-THR05", grupo[0][0]))
+        assert cur.fetchone()[0] > 0
 
 
 def test_cadencias_diferentes_convergem(conn, cenario):

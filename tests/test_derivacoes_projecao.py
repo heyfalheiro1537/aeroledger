@@ -24,6 +24,42 @@ def test_distancias_declaradas(conn):
         assert cur.fetchone()[0] == 0
 
 
+def test_premissa_ausente_recusa_em_vez_de_zerar(conn):
+    run = montar(conn, com_cabeceiras=False)
+    d = derivacoes.distancias_declaradas(conn, run)
+    assert abs(d["05"]["TORA"] - 2000) < 1e-6                         # só depende da pista
+    assert set(d["05"]) == {"TORA", "recusado"}
+    assert set(d["05"]["recusado"]) == {"TODA", "ASDA", "LDA"}
+    for fid, desig in (("XXXX-THR05", "05"), ("XXXX-THR23", "23")):  # cabeceiras sem declarações
+        ledger.append_event(conn, run, fid, "runway_direction", "BASELINE", asserted_by="teste",
+                            corpo={"adc": {"designador": desig, "pista": "XXXX-RWY"}})
+    d = derivacoes.distancias_declaradas(conn, run)
+    assert "deslocamento_m" in d["05"]["recusado"]["LDA"]
+    assert "tem_swy" in d["05"]["recusado"]["ASDA"] and "tem_cwy" in d["05"]["recusado"]["TODA"]
+
+
+def test_declaracao_contraditoria_recusa(conn):
+    run = montar(conn)                                                  # SWY registrada para a 05
+    ledger.append_event(conn, run, "XXXX-THR05", "runway_direction", "DELTA", asserted_by="teste",
+                        alteracoes={"adc.tem_swy": False}, reason="teste de contradição")
+    d = derivacoes.distancias_declaradas(conn, run)
+    assert "ASDA" not in d["05"] and "declara que não há" in d["05"]["recusado"]["ASDA"]
+    ledger.append_event(conn, run, "XXXX-THR23", "runway_direction", "DELTA", asserted_by="teste",
+                        alteracoes={"adc.tem_cwy": True}, reason="teste de contradição")
+    d = derivacoes.distancias_declaradas(conn, run)
+    assert "não registrada" in d["23"]["recusado"]["TODA"]
+    assert abs(d["23"]["LDA"] - 2000) < 1e-6                           # o resto segue calculado
+
+
+def test_deslocamento_declarado_reduz_a_lda(conn):
+    run = montar(conn)
+    ledger.append_event(conn, run, "XXXX-THR23", "runway_direction", "DELTA", asserted_by="teste",
+                        alteracoes={"adc.deslocamento_m": 150}, reason="cabeceira deslocada")
+    d = derivacoes.distancias_declaradas(conn, run)
+    assert abs(d["23"]["LDA"] - 1850) < 1e-6 and abs(d["23"]["TORA"] - 2000) < 1e-6
+    assert "recusado" not in d["23"]
+
+
 def test_barreira_recusa_em_vez_de_adivinhar(conn):
     run = montar(conn)
     ledger.append_event(conn, run, "XXXX-AG", "arresting_gear", "BASELINE", asserted_by="op",
