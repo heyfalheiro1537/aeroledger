@@ -35,8 +35,13 @@ def seed(ref, s=0.0, o=0.0, elemento="RWY_A_B"):
     return {"elemento": elemento, "referente": ref, "s": s, "o": o}
 
 
-def montar(conn, com_swy=True):
-    """Cria run, airport com referencial e a pista (forma B). Devolve run_id."""
+def montar(conn, com_swy=True, com_cabeceiras=True):
+    """Cria run, airport com referencial e a pista (forma B). Devolve run_id.
+
+    com_cabeceiras: registra as duas cabeceiras com as declarações de que as
+    distâncias dependem (deslocamento_m, tem_swy, tem_cwy). Sem elas, a regra
+    recusa TODA, ASDA e LDA.
+    """
     run = relogio.novo_run(conn, ORIGEM)
     ref_id = referencial.publicar(conn, corpo_ref())
     ledger.append_event(conn, run, "XXXX", "airport", "BASELINE", asserted_by="teste",
@@ -55,4 +60,9 @@ def montar(conn, com_swy=True):
                                    "geometria": {"primitivos": {"swy": {
                                        "tipo": "retangulo", "inicio": seed("THR_B"), "fim": seed("THR_B", s=-200),
                                        "largura": 45}}}})
+    if com_cabeceiras:
+        for fid, desig, swy in (("XXXX-THR05", "05", com_swy), ("XXXX-THR23", "23", False)):
+            ledger.append_event(conn, run, fid, "runway_direction", "BASELINE", asserted_by="teste",
+                                corpo={"adc": {"designador": desig, "pista": "XXXX-RWY", "deslocamento_m": 0,
+                                               "tem_swy": swy, "tem_cwy": False}})
     return run
