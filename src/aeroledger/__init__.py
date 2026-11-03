@@ -55,7 +55,7 @@ from .referencial import publicar as publicar_referencial
 from .referencial import referencial_vigente
 from .relogio import RelogioError, agora, avancar, instante, novo_run
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     # banco
